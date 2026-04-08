@@ -5,7 +5,24 @@ import pandas as pd
 import numpy as np
 import unicodedata
 import json
+import warnings
 from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+from sklearn.inspection import permutation_importance
+
+warnings.filterwarnings("ignore")
 
 # --------------------------------------------------
 # CONFIGURACIÓN GENERAL
@@ -40,47 +57,35 @@ st.markdown("""
     font-size: 0.9rem;
     color: #9aa0a6;
 }
+.block-card {
+    background-color: #0f172a;
+    padding: 1rem;
+    border-radius: 14px;
+    border: 1px solid #1e293b;
+    margin-bottom: 0.8rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # --------------------------------------------------
-# FUNCIONES DE NEGOCIO
+# SEGURIDAD / SANITIZACIÓN BÁSICA
 # --------------------------------------------------
-def calcular_riesgo_temperatura(temp: float) -> float:
-    if 26 <= temp <= 30:
-        return 25.0
-    elif temp < 26:
-        return max(0.0, 25.0 - (26 - temp) * 2.5)
-    else:
-        return max(0.0, 25.0 - (temp - 30) * 2.5)
+ALLOWED_BASE_DIR = Path("dataset").resolve()
 
+def ruta_segura(ruta: str | Path) -> Path:
+    ruta = Path(ruta).resolve()
+    if not str(ruta).startswith(str(ALLOWED_BASE_DIR)):
+        raise ValueError("Ruta fuera del directorio permitido.")
+    return ruta
 
-def calcular_riesgo_lluvia(precip: float) -> float:
-    return min(25.0, (precip / 200.0) * 25.0)
-
-
-def calcular_riesgo_estacionalidad(semana_epi: int) -> float:
-    if 1 <= semana_epi <= 52:
-        distancia = abs(12 - semana_epi)
-        riesgo = 20.0 - distancia * 1.3
-        return max(5.0, min(20.0, riesgo))
-    return 5.0
-
-
-def calcular_riesgo_historial(casos_previos: int) -> float:
-    return min(30.0, (casos_previos / 50.0) * 30.0)
-
-
-def clasificar_riesgo(riesgo_total: float):
-    if riesgo_total < 35:
-        return "BAJO", "#22c55e", "Condiciones relativamente favorables, vigilancia estándar."
-    elif riesgo_total < 70:
-        return "MODERADO", "#f59e0b", "Condiciones de atención; conviene reforzar monitoreo y prevención."
-    else:
-        return "ALTO", "#ef4444", "Alta probabilidad de incremento; se recomienda respuesta preventiva intensiva."
+def sanitizar_texto(texto: str) -> str:
+    texto = str(texto).strip()
+    texto = texto.replace("<", "").replace(">", "")
+    texto = texto.replace(";", "").replace("--", "")
+    return texto
 
 # --------------------------------------------------
-# FUNCIONES DE LIMPIEZA
+# FUNCIONES AUXILIARES
 # --------------------------------------------------
 def normalizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -119,6 +124,7 @@ def _primera_columna_disponible(df: pd.DataFrame, candidatas: list[str]) -> str 
             return columna
     return None
 
+
 def estandarizar_nombre_provincia(texto: str) -> str:
     texto = str(texto).strip().upper()
     texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("utf-8")
@@ -131,10 +137,11 @@ def estandarizar_nombre_provincia(texto: str) -> str:
         "GALAPAGOS": "GALAPAGOS",
         "LOS RÍOS": "LOS RIOS",
         "LOS RIOS": "LOS RIOS",
-        "SANTO DOMINGO DE LOS TSACHILAS": "SANTO DOMINGO DE LOS TSACHILAS",
         "SANTO DOMINGO DE LOS TSÁCHILAS": "SANTO DOMINGO DE LOS TSACHILAS",
+        "SANTO DOMINGO DE LOS TSACHILAS": "SANTO DOMINGO DE LOS TSACHILAS",
         "MORONA-SANTIAGO": "MORONA SANTIAGO",
         "ZAMORA-CHINCHIPE": "ZAMORA CHINCHIPE",
+        "SUCUMBÍOS": "SUCUMBIOS",
         "EL ORO": "EL ORO",
         "SANTA ELENA": "SANTA ELENA",
     }
@@ -145,7 +152,6 @@ def estandarizar_nombre_provincia(texto: str) -> str:
 def preparar_geojson_provincias(geojson: dict) -> dict:
     for feature in geojson["features"]:
         props = feature.get("properties", {})
-
         nombre = (
             props.get("name")
             or props.get("NAME")
@@ -155,92 +161,9 @@ def preparar_geojson_provincias(geojson: dict) -> dict:
             or props.get("NOM_PROV")
             or ""
         )
-
         feature["properties"]["provincia_std"] = estandarizar_nombre_provincia(nombre)
-
     return geojson
 
-
-def obtener_resumen_provincial(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    df["temperatura_promedio"] = pd.to_numeric(df["temperatura_promedio"], errors="coerce").fillna(28.0)
-    df["precipitacion_total"] = pd.to_numeric(df["precipitacion_total"], errors="coerce").fillna(80.0)
-    df["casos_previos"] = pd.to_numeric(df["casos_previos"], errors="coerce").fillna(0)
-    df["semana_epi"] = pd.to_numeric(df["semana_epi"], errors="coerce").fillna(12).astype(int)
-    df["casos_dengue"] = pd.to_numeric(df["casos_dengue"], errors="coerce").fillna(0)
-
-    df["riesgo_temp"] = df["temperatura_promedio"].apply(calcular_riesgo_temperatura)
-    df["riesgo_lluvia"] = df["precipitacion_total"].apply(calcular_riesgo_lluvia)
-    df["riesgo_clima"] = df["riesgo_temp"] + df["riesgo_lluvia"]
-    df["riesgo_estacionalidad"] = df["semana_epi"].apply(calcular_riesgo_estacionalidad)
-    df["riesgo_historial"] = df["casos_previos"].apply(calcular_riesgo_historial)
-    df["riesgo_total"] = (
-        df["riesgo_clima"] + df["riesgo_estacionalidad"] + df["riesgo_historial"]
-    ).clip(upper=100)
-
-    df["provincia_std"] = df["provincia_std"].apply(estandarizar_nombre_provincia)
-
-    # Último registro disponible por provincia dentro del filtro actual
-    ultimo = (
-        df.sort_values(["provincia_std", "anio", "semana_epi"])
-          .groupby("provincia_std", as_index=False)
-          .tail(1)
-          .copy()
-    )
-
-    ultimo["nivel"] = ultimo["riesgo_total"].apply(lambda x: clasificar_riesgo(x)[0])
-
-    # También sumamos casos por provincia dentro del filtro actual
-    casos = (
-        df.groupby("provincia_std", as_index=False)["casos_dengue"]
-          .sum()
-          .rename(columns={"casos_dengue": "casos_dengue_periodo"})
-    )
-
-    resumen = ultimo.merge(casos, on="provincia_std", how="left")
-    return resumen
-
-
-def crear_mapa_provincias(df_resumen: pd.DataFrame, geojson: dict):
-    fig = px.choropleth_mapbox(
-        df_resumen,
-        geojson=geojson,
-        locations="provincia_std",
-        featureidkey="properties.provincia_std",
-        color="riesgo_total",
-        color_continuous_scale=[
-            [0.00, "#22c55e"],
-            [0.50, "#f59e0b"],
-            [1.00, "#ef4444"]
-        ],
-        range_color=(0, 100),
-        mapbox_style="carto-positron",
-        zoom=4.8,
-        center={"lat": -1.6, "lon": -78.3},
-        opacity=0.78,
-        hover_name="provincia_std",
-        hover_data={
-            "riesgo_total": ":.1f",
-            "nivel": True,
-            "anio": True,
-            "semana_epi": True,
-            "casos_dengue_periodo": True,
-            "temperatura_promedio": ":.1f",
-            "precipitacion_total": ":.1f",
-            "provincia_std": False
-        },
-    )
-
-    fig.update_traces(marker_line_width=1, marker_line_color="white")
-
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=50, b=0),
-        height=540,
-        coloraxis_colorbar=dict(title="Riesgo %")
-    )
-
-    return fig
 
 CODIGOS_PROVINCIA_ECUADOR = {
     "01": "AZUAY",
@@ -270,16 +193,16 @@ CODIGOS_PROVINCIA_ECUADOR = {
 }
 
 # --------------------------------------------------
-# CONSTRUCCIÓN AUTOMÁTICA DEL DATASET UNIFICADO
+# CONSTRUCCIÓN DEL DATASET UNIFICADO
 # --------------------------------------------------
 def construir_dataset_unificado(
     ruta_dengue: str | Path,
     ruta_lluvia: str | Path,
     ruta_clima: str | Path,
 ) -> pd.DataFrame:
-    ruta_dengue = Path(ruta_dengue)
-    ruta_lluvia = Path(ruta_lluvia)
-    ruta_clima = Path(ruta_clima)
+    ruta_dengue = ruta_segura(ruta_dengue)
+    ruta_lluvia = ruta_segura(ruta_lluvia)
+    ruta_clima = ruta_segura(ruta_clima)
 
     # ----------------------------
     # DENGUE
@@ -304,13 +227,10 @@ def construir_dataset_unificado(
         df_hoja["provincia_std"] = limpiar_texto_ubicacion(df_hoja[col_provincia]).apply(estandarizar_nombre_provincia)
         df_hoja["casos_dengue"] = (
             pd.to_numeric(df_hoja[col_total], errors="coerce").fillna(1)
-            if col_total
-            else 1
+            if col_total else 1
         )
 
-        hojas_dengue.append(
-            df_hoja[["anio", "semana_epi", "provincia_std", "casos_dengue"]]
-        )
+        hojas_dengue.append(df_hoja[["anio", "semana_epi", "provincia_std", "casos_dengue"]])
 
     if not hojas_dengue:
         raise ValueError("No se pudieron identificar columnas válidas en el archivo de dengue.")
@@ -323,11 +243,8 @@ def construir_dataset_unificado(
     dengue = (
         dengue.groupby(["anio", "semana_epi", "provincia_std"], as_index=False)["casos_dengue"]
         .sum()
+        .drop_duplicates()
         .sort_values(["provincia_std", "anio", "semana_epi"])
-    )
-
-    dengue["casos_previos"] = (
-        dengue.groupby(["provincia_std"])["casos_dengue"].shift(1).fillna(0)
     )
 
     # ----------------------------
@@ -335,11 +252,18 @@ def construir_dataset_unificado(
     # ----------------------------
     lluvia = pd.read_csv(ruta_lluvia)
     lluvia = normalizar_columnas(lluvia)
+
+    if "date" not in lluvia.columns or "pcode" not in lluvia.columns or "rfh" not in lluvia.columns:
+        raise ValueError("El dataset de lluvia no contiene las columnas esperadas: date, pcode, rfh.")
+
     lluvia["date"] = pd.to_datetime(lluvia["date"], errors="coerce")
     lluvia["rfh"] = pd.to_numeric(lluvia["rfh"], errors="coerce")
     lluvia["pcode"] = lluvia["pcode"].astype(str).str.upper()
+
     lluvia["codigo_provincia"] = lluvia["pcode"].str.extract(r"EC(\d{2})")
-    lluvia["provincia_std"] = lluvia["codigo_provincia"].map(CODIGOS_PROVINCIA_ECUADOR).apply(estandarizar_nombre_provincia)
+    lluvia["provincia_std"] = lluvia["codigo_provincia"].map(CODIGOS_PROVINCIA_ECUADOR)
+    lluvia["provincia_std"] = lluvia["provincia_std"].apply(lambda x: estandarizar_nombre_provincia(x) if pd.notna(x) else x)
+
     lluvia["anio"] = lluvia["date"].dt.year
     lluvia["semana_epi"] = lluvia["date"].dt.isocalendar().week.astype("Int64")
 
@@ -348,6 +272,7 @@ def construir_dataset_unificado(
         lluvia.groupby(["anio", "semana_epi", "provincia_std"], as_index=False)["rfh"]
         .sum()
         .rename(columns={"rfh": "precipitacion_total"})
+        .drop_duplicates()
     )
 
     # ----------------------------
@@ -355,30 +280,38 @@ def construir_dataset_unificado(
     # ----------------------------
     clima = pd.read_csv(ruta_clima)
     clima = normalizar_columnas(clima)
+
+    if "date" not in clima.columns:
+        raise ValueError("El dataset climático no contiene la columna 'date'.")
+
     clima["date"] = pd.to_datetime(clima["date"], errors="coerce")
 
+    # Intento de usar Ecuador; si no existe, usa South America
     if "country_name" in clima.columns and "ecuador" in clima["country_name"].astype(str).str.lower().unique():
         clima_base = clima[clima["country_name"].astype(str).str.lower() == "ecuador"].copy()
         fuente_clima = "Ecuador"
-    else:
+    elif "region" in clima.columns:
         clima_base = clima[clima["region"].astype(str).str.lower() == "south america"].copy()
         fuente_clima = "South America"
+    else:
+        clima_base = clima.copy()
+        fuente_clima = "Global"
 
     clima_base["anio"] = clima_base["date"].dt.year
     clima_base["semana_epi"] = clima_base["date"].dt.isocalendar().week.astype("Int64")
 
     columnas_clima = [c for c in ["temperature_celsius", "vector_disease_risk_score", "precipitation_mm"] if c in clima_base.columns]
+    if not columnas_clima:
+        raise ValueError("No se encontraron columnas climáticas útiles.")
 
     clima_base = (
         clima_base.groupby(["anio", "semana_epi"], as_index=False)[columnas_clima]
         .mean()
-        .rename(
-            columns={
-                "temperature_celsius": "temperatura_promedio",
-                "vector_disease_risk_score": "riesgo_vectorial_climatico",
-                "precipitation_mm": "precipitacion_climatica_mm",
-            }
-        )
+        .rename(columns={
+            "temperature_celsius": "temperatura_promedio",
+            "vector_disease_risk_score": "riesgo_vectorial_climatico",
+            "precipitation_mm": "precipitacion_climatica_mm",
+        })
     )
     clima_base["fuente_clima"] = fuente_clima
 
@@ -388,69 +321,390 @@ def construir_dataset_unificado(
     base_unificada = dengue.merge(
         lluvia,
         on=["anio", "semana_epi", "provincia_std"],
-        how="left",
+        how="left"
     ).merge(
         clima_base,
         on=["anio", "semana_epi"],
-        how="left",
+        how="left"
     )
 
-    return base_unificada.sort_values(["anio", "semana_epi", "provincia_std"]).reset_index(drop=True)
+    # Imputación / limpieza
+    base_unificada["precipitacion_total"] = pd.to_numeric(base_unificada["precipitacion_total"], errors="coerce")
+    base_unificada["temperatura_promedio"] = pd.to_numeric(base_unificada["temperatura_promedio"], errors="coerce")
+    base_unificada["riesgo_vectorial_climatico"] = pd.to_numeric(base_unificada.get("riesgo_vectorial_climatico", np.nan), errors="coerce")
+    base_unificada["precipitacion_climatica_mm"] = pd.to_numeric(base_unificada.get("precipitacion_climatica_mm", np.nan), errors="coerce")
+
+    base_unificada["precipitacion_total"] = base_unificada["precipitacion_total"].fillna(base_unificada["precipitacion_total"].median())
+    base_unificada["temperatura_promedio"] = base_unificada["temperatura_promedio"].fillna(base_unificada["temperatura_promedio"].median())
+    base_unificada["riesgo_vectorial_climatico"] = base_unificada["riesgo_vectorial_climatico"].fillna(base_unificada["riesgo_vectorial_climatico"].median())
+    base_unificada["precipitacion_climatica_mm"] = base_unificada["precipitacion_climatica_mm"].fillna(base_unificada["precipitacion_climatica_mm"].median())
+
+    # Rangos válidos
+    base_unificada["semana_epi"] = pd.to_numeric(base_unificada["semana_epi"], errors="coerce").clip(1, 53)
+    base_unificada["casos_dengue"] = pd.to_numeric(base_unificada["casos_dengue"], errors="coerce").fillna(0).clip(lower=0)
+
+    return base_unificada.sort_values(["provincia_std", "anio", "semana_epi"]).reset_index(drop=True)
 
 
 # --------------------------------------------------
-# MAPA DE RIESGO POR PROVINCIA
+# FEATURE ENGINEERING
 # --------------------------------------------------
-def construir_riesgo_por_provincia(base_modelo: pd.DataFrame) -> pd.DataFrame:
-    df = base_modelo.copy()
+def agregar_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.sort_values(["provincia_std", "anio", "semana_epi"]).reset_index(drop=True)
 
-    df["temperatura_promedio"] = pd.to_numeric(df["temperatura_promedio"], errors="coerce").fillna(28.0)
-    df["precipitacion_total"] = pd.to_numeric(df["precipitacion_total"], errors="coerce").fillna(80.0)
-    df["semana_epi"] = pd.to_numeric(df["semana_epi"], errors="coerce").fillna(12).astype(int)
-    df["casos_previos"] = pd.to_numeric(df["casos_previos"], errors="coerce").fillna(0)
+    # índice temporal simple
+    df["time_index"] = df["anio"] * 100 + df["semana_epi"]
 
-    df["riesgo_temp"] = df["temperatura_promedio"].apply(calcular_riesgo_temperatura)
-    df["riesgo_lluvia"] = df["precipitacion_total"].apply(calcular_riesgo_lluvia)
-    df["riesgo_clima"] = df["riesgo_temp"] + df["riesgo_lluvia"]
-    df["riesgo_estacionalidad"] = df["semana_epi"].apply(calcular_riesgo_estacionalidad)
-    df["riesgo_historial"] = df["casos_previos"].apply(calcular_riesgo_historial)
+    # lags
+    for lag in [1, 2, 3, 4]:
+        df[f"casos_lag_{lag}"] = df.groupby("provincia_std")["casos_dengue"].shift(lag)
 
-    df["riesgo_total"] = (
-        df["riesgo_clima"] + df["riesgo_estacionalidad"] + df["riesgo_historial"]
-    ).clip(upper=100)
+    # medias móviles
+    df["media_3_sem"] = (
+        df.groupby("provincia_std")["casos_dengue"]
+        .transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+    )
+    df["media_4_sem_lluvia"] = (
+        df.groupby("provincia_std")["precipitacion_total"]
+        .transform(lambda s: s.shift(1).rolling(4, min_periods=1).mean())
+    )
 
-    # Último registro por provincia
-    df = (
+    # ratios e interacciones
+    df["ratio_lluvia_temp"] = df["precipitacion_total"] / (df["temperatura_promedio"].replace(0, np.nan))
+    df["interaccion_temp_lluvia"] = df["temperatura_promedio"] * df["precipitacion_total"]
+    df["interaccion_hist_clima"] = df["casos_lag_1"] * df["temperatura_promedio"]
+
+    # temporalidad cíclica
+    df["semana_sin"] = np.sin(2 * np.pi * df["semana_epi"] / 52.0)
+    df["semana_cos"] = np.cos(2 * np.pi * df["semana_epi"] / 52.0)
+
+    # target: casos futuros 1 semana adelante
+    df["casos_futuros"] = df.groupby("provincia_std")["casos_dengue"].shift(-1)
+
+    # clasificación del riesgo futuro
+    q1 = df["casos_futuros"].quantile(0.33)
+    q2 = df["casos_futuros"].quantile(0.66)
+
+    def clasif(c):
+        if pd.isna(c):
+            return np.nan
+        if c <= q1:
+            return "BAJO"
+        elif c <= q2:
+            return "MEDIO"
+        return "ALTO"
+
+    df["riesgo_futuro_clase"] = df["casos_futuros"].apply(clasif)
+
+    # sanitización final
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    cols_fill = [
+        "casos_lag_1", "casos_lag_2", "casos_lag_3", "casos_lag_4",
+        "media_3_sem", "media_4_sem_lluvia",
+        "ratio_lluvia_temp", "interaccion_temp_lluvia", "interaccion_hist_clima"
+    ]
+    for c in cols_fill:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    return df
+
+
+# --------------------------------------------------
+# SELECCIÓN DE CARACTERÍSTICAS
+# --------------------------------------------------
+def seleccionar_features(df_modelo: pd.DataFrame):
+    features = [
+        "temperatura_promedio",
+        "precipitacion_total",
+        "riesgo_vectorial_climatico",
+        "precipitacion_climatica_mm",
+        "semana_epi",
+        "semana_sin",
+        "semana_cos",
+        "casos_lag_1",
+        "casos_lag_2",
+        "casos_lag_3",
+        "casos_lag_4",
+        "media_3_sem",
+        "media_4_sem_lluvia",
+        "ratio_lluvia_temp",
+        "interaccion_temp_lluvia",
+        "interaccion_hist_clima",
+    ]
+
+    existentes = [f for f in features if f in df_modelo.columns]
+
+    # selección inicial por correlación con casos futuros
+    corr_base = df_modelo[existentes + ["casos_futuros"]].copy()
+    corr = corr_base.corr(numeric_only=True)["casos_futuros"].drop("casos_futuros").abs().sort_values(ascending=False)
+
+    top_features = corr.head(min(10, len(corr))).index.tolist()
+    return top_features, corr
+
+
+# --------------------------------------------------
+# ENTRENAMIENTO / MODELADO
+# --------------------------------------------------
+def entrenar_modelos(df_full: pd.DataFrame):
+    df = df_full.copy()
+    df = df.dropna(subset=["riesgo_futuro_clase", "casos_futuros"])
+
+    selected_features, corr = seleccionar_features(df)
+
+    # split temporal
+    tiempo_ordenado = df[["anio", "semana_epi"]].drop_duplicates().sort_values(["anio", "semana_epi"])
+    corte = int(len(tiempo_ordenado) * 0.80)
+    tiempo_train = tiempo_ordenado.iloc[:corte]
+    tiempo_test = tiempo_ordenado.iloc[corte:]
+
+    train_keys = set(zip(tiempo_train["anio"], tiempo_train["semana_epi"]))
+    test_keys = set(zip(tiempo_test["anio"], tiempo_test["semana_epi"]))
+
+    df_train = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(train_keys)].copy()
+    df_test = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(test_keys)].copy()
+
+    X_train = df_train[selected_features].copy()
+    y_train = df_train["riesgo_futuro_clase"].copy()
+
+    X_test = df_test[selected_features].copy()
+    y_test = df_test["riesgo_futuro_clase"].copy()
+
+    # Modelo 1: Random Forest
+    rf = RandomForestClassifier(random_state=42, class_weight="balanced")
+    rf_params = {
+        "n_estimators": [100, 200],
+        "max_depth": [4, 8, None],
+        "min_samples_split": [2, 5]
+    }
+    grid_rf = GridSearchCV(
+        rf,
+        rf_params,
+        scoring="f1_macro",
+        cv=3,
+        n_jobs=-1
+    )
+    grid_rf.fit(X_train, y_train)
+
+    # Modelo 2: Gradient Boosting
+    gb = GradientBoostingClassifier(random_state=42)
+    gb_params = {
+        "n_estimators": [100, 150],
+        "learning_rate": [0.05, 0.1],
+        "max_depth": [2, 3]
+    }
+    grid_gb = GridSearchCV(
+        gb,
+        gb_params,
+        scoring="f1_macro",
+        cv=3,
+        n_jobs=-1
+    )
+    grid_gb.fit(X_train, y_train)
+
+    modelos = {
+        "Random Forest": grid_rf.best_estimator_,
+        "Gradient Boosting": grid_gb.best_estimator_,
+    }
+
+    resultados = {}
+    mejor_modelo_nombre = None
+    mejor_f1 = -1
+    mejor_modelo = None
+
+    for nombre, modelo in modelos.items():
+        pred = modelo.predict(X_test)
+        acc = accuracy_score(y_test, pred)
+        prec = precision_score(y_test, pred, average="macro", zero_division=0)
+        rec = recall_score(y_test, pred, average="macro", zero_division=0)
+        f1 = f1_score(y_test, pred, average="macro", zero_division=0)
+
+        resultados[nombre] = {
+            "modelo": modelo,
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "y_test": y_test,
+            "pred": pred,
+            "X_test": X_test,
+            "X_train": X_train,
+            "best_params": grid_rf.best_params_ if nombre == "Random Forest" else grid_gb.best_params_,
+        }
+
+        if f1 > mejor_f1:
+            mejor_f1 = f1
+            mejor_modelo_nombre = nombre
+            mejor_modelo = modelo
+
+    return {
+        "selected_features": selected_features,
+        "corr": corr,
+        "df_train": df_train,
+        "df_test": df_test,
+        "resultados": resultados,
+        "mejor_modelo_nombre": mejor_modelo_nombre,
+        "mejor_modelo": mejor_modelo
+    }
+
+def entrenar_modelos_regresion(df_full: pd.DataFrame):
+    df = df_full.copy()
+    df = df.dropna(subset=["casos_futuros"])
+
+    selected_features, corr = seleccionar_features(df)
+
+    # split temporal
+    tiempo_ordenado = df[["anio", "semana_epi"]].drop_duplicates().sort_values(["anio", "semana_epi"])
+    corte = int(len(tiempo_ordenado) * 0.80)
+    tiempo_train = tiempo_ordenado.iloc[:corte]
+    tiempo_test = tiempo_ordenado.iloc[corte:]
+
+    train_keys = set(zip(tiempo_train["anio"], tiempo_train["semana_epi"]))
+    test_keys = set(zip(tiempo_test["anio"], tiempo_test["semana_epi"]))
+
+    df_train = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(train_keys)].copy()
+    df_test = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(test_keys)].copy()
+
+    X_train = df_train[selected_features].copy()
+    y_train = df_train["casos_futuros"].copy()
+
+    X_test = df_test[selected_features].copy()
+    y_test = df_test["casos_futuros"].copy()
+
+    modelos = {
+        "Random Forest Regressor": RandomForestRegressor(
+            n_estimators=200,
+            max_depth=8,
+            random_state=42
+        ),
+        "Gradient Boosting Regressor": GradientBoostingRegressor(
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42
+        )
+    }
+
+    resultados = {}
+    mejor_modelo_nombre = None
+    mejor_mae = float("inf")
+    mejor_modelo = None
+
+    for nombre, modelo in modelos.items():
+        modelo.fit(X_train, y_train)
+        pred = modelo.predict(X_test)
+
+        mae = mean_absolute_error(y_test, pred)
+        rmse = np.sqrt(mean_squared_error(y_test, pred))
+        r2 = r2_score(y_test, pred)
+
+        resultados[nombre] = {
+            "modelo": modelo,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "y_test": y_test,
+            "pred": pred,
+            "X_test": X_test,
+            "X_train": X_train,
+        }
+
+        if mae < mejor_mae:
+            mejor_mae = mae
+            mejor_modelo_nombre = nombre
+            mejor_modelo = modelo
+
+    return {
+        "selected_features": selected_features,
+        "corr": corr,
+        "df_train": df_train,
+        "df_test": df_test,
+        "resultados": resultados,
+        "mejor_modelo_nombre": mejor_modelo_nombre,
+        "mejor_modelo": mejor_modelo
+    }
+
+# --------------------------------------------------
+# INTERPRETABILIDAD
+# --------------------------------------------------
+def obtener_importancias(modelo, X_test: pd.DataFrame) -> pd.DataFrame:
+    if hasattr(modelo, "feature_importances_"):
+        imp = pd.DataFrame({
+            "feature": X_test.columns,
+            "importance": modelo.feature_importances_
+        }).sort_values("importance", ascending=False)
+        return imp
+
+    perm = permutation_importance(modelo, X_test, modelo.predict(X_test), n_repeats=5, random_state=42)
+    imp = pd.DataFrame({
+        "feature": X_test.columns,
+        "importance": perm.importances_mean
+    }).sort_values("importance", ascending=False)
+    return imp
+
+
+# --------------------------------------------------
+# MAPA / RESUMEN PROVINCIAL
+# --------------------------------------------------
+def construir_prediccion_provincial(df_modelo: pd.DataFrame, modelo, selected_features: list[str]) -> pd.DataFrame:
+    df = df_modelo.copy()
+
+    # usar último registro disponible por provincia
+    ultimo = (
         df.sort_values(["provincia_std", "anio", "semana_epi"])
           .groupby("provincia_std", as_index=False)
           .tail(1)
           .copy()
     )
 
-    df["nivel"] = df["riesgo_total"].apply(lambda x: clasificar_riesgo(x)[0])
-    return df
+    X_pred = ultimo[selected_features].copy()
+    pred = modelo.predict(X_pred)
 
+    if hasattr(modelo, "predict_proba"):
+        proba = modelo.predict_proba(X_pred)
+        conf = proba.max(axis=1) * 100
+    else:
+        conf = np.full(len(ultimo), 0.0)
 
-def cargar_geojson_provincias(ruta_geojson: str | Path):
-    ruta_geojson = Path(ruta_geojson)
-    with open(ruta_geojson, "r", encoding="utf-8") as f:
-        geojson = json.load(f)
+    mapping_riesgo_num = {"BAJO": 33, "MEDIO": 66, "ALTO": 100}
+    ultimo["nivel_predicho"] = pred
+    ultimo["riesgo_total"] = pd.Series(pred).map(mapping_riesgo_num).values
+    ultimo["confianza_modelo"] = conf
 
-    for feature in geojson["features"]:
-        props = feature.get("properties", {})
+    resumen_casos = (
+        df.groupby("provincia_std", as_index=False)["casos_dengue"]
+        .sum()
+        .rename(columns={"casos_dengue": "casos_dengue_periodo"})
+    )
 
-        nombre = (
-            props.get("name")
-            or props.get("NAME")
-            or props.get("provincia")
-            or props.get("PROVINCIA")
-            or props.get("DPA_DESPRO")
-            or ""
-        )
+    ultimo = ultimo.merge(resumen_casos, on="provincia_std", how="left")
+    return ultimo
 
-        feature["properties"]["provincia_std"] = normalizar_texto_simple(nombre)
+def construir_prediccion_casos_provincial(df_modelo: pd.DataFrame, modelo_regresion, selected_features: list[str]) -> pd.DataFrame:
+    df = df_modelo.copy()
 
-    return geojson
+    ultimo = (
+        df.sort_values(["provincia_std", "anio", "semana_epi"])
+          .groupby("provincia_std", as_index=False)
+          .tail(1)
+          .copy()
+    )
+
+    X_pred = ultimo[selected_features].copy()
+    pred_casos = modelo_regresion.predict(X_pred)
+
+    ultimo["casos_predichos_prox_semana"] = np.maximum(pred_casos, 0).round().astype(int)
+
+    return ultimo[[
+        "provincia_std",
+        "anio",
+        "semana_epi",
+        "casos_dengue",
+        "casos_predichos_prox_semana",
+        "temperatura_promedio",
+        "precipitacion_total"
+    ]].sort_values("casos_predichos_prox_semana", ascending=False)
 
 
 def crear_mapa_provincias(df_riesgo: pd.DataFrame, geojson: dict):
@@ -472,31 +726,35 @@ def crear_mapa_provincias(df_riesgo: pd.DataFrame, geojson: dict):
         mapbox_style="carto-positron",
         zoom=4.8,
         center={"lat": -1.6, "lon": -78.3},
-        opacity=0.75,
+        opacity=0.78,
         hover_name="provincia_std",
         hover_data={
-            "riesgo_total": ":.1f",
-            "casos_dengue": True,
+            "nivel_predicho": True,
+            "confianza_modelo": ":.1f",
+            "anio": True,
+            "semana_epi": True,
+            "casos_dengue_periodo": True,
             "temperatura_promedio": ":.1f",
             "precipitacion_total": ":.1f",
             "provincia_std": False
         },
     )
 
+    fig.update_traces(marker_line_width=1, marker_line_color="white")
     fig.update_layout(
-        margin=dict(l=0, r=0, t=50, b=0),
-        height=520,
-        coloraxis_colorbar=dict(title="Riesgo %")
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=540,
+        coloraxis_colorbar=dict(title="Riesgo")
     )
-
     return fig
+
 
 # --------------------------------------------------
 # TÍTULO
 # --------------------------------------------------
 st.markdown('<div class="main-title">🦟 Predicción de Riesgo: Dengue</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Dashboard conceptual con consolidación automática de 3 datasets y visualización provincial del riesgo.</div>',
+    '<div class="subtitle">Pipeline completo: integración, preparación, ingeniería de características, modelado, evaluación, despliegue e interpretabilidad.</div>',
     unsafe_allow_html=True
 )
 st.markdown("---")
@@ -512,23 +770,25 @@ rutas_locales = {
 }
 
 # --------------------------------------------------
-# CARGA AUTOMÁTICA
+# CARGA Y PREPARACIÓN
 # --------------------------------------------------
 @st.cache_data(show_spinner=False)
-def cargar_base_modelo():
-    return construir_dataset_unificado(
+def cargar_y_preparar():
+    base = construir_dataset_unificado(
         rutas_locales["dengue"],
         rutas_locales["lluvia"],
         rutas_locales["clima"],
     )
+    base = agregar_features(base)
+    return base
 
 base_modelo = None
 
 try:
-    base_modelo = cargar_base_modelo()
-    st.success("Base unificada generada automáticamente desde los archivos locales.")
+    base_modelo = cargar_y_preparar()
+    st.success("Base unificada, limpiada y enriquecida correctamente.")
 except ImportError:
-    st.error("Hace falta instalar `openpyxl` para leer el archivo Excel de dengue.")
+    st.error("Hace falta instalar openpyxl para leer el Excel.")
 except Exception as exc:
     st.error(f"No se pudo construir la base unificada: {exc}")
 
@@ -536,12 +796,38 @@ if base_modelo is None or base_modelo.empty:
     st.stop()
 
 # --------------------------------------------------
-# SELECCIÓN DE PROVINCIA
+# ENTRENAMIENTO
+# --------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def entrenar_pipeline(df):
+    return entrenar_modelos(df)
+
+with st.spinner("Entrenando modelos y evaluando pipeline..."):
+    entrenamiento = entrenar_pipeline(base_modelo)
+
+@st.cache_resource(show_spinner=False)
+def entrenar_pipeline_regresion(df):
+    return entrenar_modelos_regresion(df)
+
+with st.spinner("Entrenando modelo de regresión para estimar número de casos..."):
+    entrenamiento_reg = entrenar_pipeline_regresion(base_modelo)
+
+mejor_modelo_reg = entrenamiento_reg["mejor_modelo"]
+mejor_modelo_reg_nombre = entrenamiento_reg["mejor_modelo_nombre"]
+resultado_mejor_reg = entrenamiento_reg["resultados"][mejor_modelo_reg_nombre]
+
+mejor_modelo = entrenamiento["mejor_modelo"]
+mejor_modelo_nombre = entrenamiento["mejor_modelo_nombre"]
+selected_features = entrenamiento["selected_features"]
+resultados = entrenamiento["resultados"]
+resultado_mejor = resultados[mejor_modelo_nombre]
+
+# --------------------------------------------------
+# FILTROS
 # --------------------------------------------------
 st.subheader("Filtros de análisis")
 
 anios_disponibles = sorted(base_modelo["anio"].dropna().unique().tolist())
-
 opciones_anio = ["Todos"] + [int(a) for a in anios_disponibles]
 anio_sel = st.selectbox("Filtrar por año", opciones_anio)
 
@@ -557,42 +843,78 @@ df_filtrado = base_filtrada[base_filtrada["provincia_std"] == provincia_sel].cop
 
 if not df_filtrado.empty:
     fila = df_filtrado.sort_values(["anio", "semana_epi"]).iloc[-1]
-
-    temp = float(fila["temperatura_promedio"]) if pd.notna(fila["temperatura_promedio"]) else 28.0
-    precip = float(fila["precipitacion_total"]) if pd.notna(fila["precipitacion_total"]) else 80.0
-    semana_epi = int(fila["semana_epi"])
-    casos_previos = int(fila["casos_previos"]) if pd.notna(fila["casos_previos"]) else 0
 else:
-    temp = 28.0
-    precip = 80.0
-    semana_epi = 12
-    casos_previos = 20
+    fila = base_modelo.sort_values(["anio", "semana_epi"]).iloc[-1]
+
+temp = float(fila.get("temperatura_promedio", 28.0))
+precip = float(fila.get("precipitacion_total", 80.0))
+semana_epi = int(fila.get("semana_epi", 12))
+casos_lag_1 = int(fila.get("casos_lag_1", 0))
+casos_lag_2 = int(fila.get("casos_lag_2", 0))
+casos_lag_3 = int(fila.get("casos_lag_3", 0))
+casos_lag_4 = int(fila.get("casos_lag_4", 0))
+riesgo_vectorial = float(fila.get("riesgo_vectorial_climatico", 0))
+precip_climatica = float(fila.get("precipitacion_climatica_mm", 0))
 
 # --------------------------------------------------
-# SIDEBAR - CONTROLES
+# SIDEBAR
 # --------------------------------------------------
 st.sidebar.header("Parámetros de simulación")
 
-temp = st.sidebar.slider("Temperatura (°C)", 15.0, 35.0, float(temp), 0.5)
-precip = st.sidebar.slider("Precipitación (mm/semana)", 0.0, 300.0, float(min(300.0, precip)), 5.0)
+temp = st.sidebar.slider("Temperatura (°C)", 15.0, 40.0, float(temp), 0.5)
+precip = st.sidebar.slider("Precipitación (mm/semana)", 0.0, 500.0, float(min(500.0, precip)), 5.0)
 semana_epi = st.sidebar.slider("Semana epidemiológica", 1, 52, int(semana_epi), 1)
-casos_previos = st.sidebar.slider("Casos previos (t-1)", 0, 100, int(min(100, casos_previos)), 1)
+casos_lag_1 = st.sidebar.slider("Casos lag 1", 0, 300, int(min(300, casos_lag_1)), 1)
+casos_lag_2 = st.sidebar.slider("Casos lag 2", 0, 300, int(min(300, casos_lag_2)), 1)
+casos_lag_3 = st.sidebar.slider("Casos lag 3", 0, 300, int(min(300, casos_lag_3)), 1)
+casos_lag_4 = st.sidebar.slider("Casos lag 4", 0, 300, int(min(300, casos_lag_4)), 1)
 
 st.sidebar.markdown("---")
-st.sidebar.info("El tablero usa la base unificada local y ya no requiere carga manual de archivos.")
+st.sidebar.info("La app ya entrena modelos reales y usa el mejor para inferencia de riesgo.")
 
 # --------------------------------------------------
-# CÁLCULOS
+# INFERENCIA INDIVIDUAL
 # --------------------------------------------------
-riesgo_temp = calcular_riesgo_temperatura(temp)
-riesgo_lluvia = calcular_riesgo_lluvia(precip)
-riesgo_clima = riesgo_temp + riesgo_lluvia
+registro_pred = {
+    "temperatura_promedio": temp,
+    "precipitacion_total": precip,
+    "riesgo_vectorial_climatico": riesgo_vectorial if pd.notna(riesgo_vectorial) else 0,
+    "precipitacion_climatica_mm": precip_climatica if pd.notna(precip_climatica) else precip,
+    "semana_epi": semana_epi,
+    "semana_sin": np.sin(2 * np.pi * semana_epi / 52.0),
+    "semana_cos": np.cos(2 * np.pi * semana_epi / 52.0),
+    "casos_lag_1": casos_lag_1,
+    "casos_lag_2": casos_lag_2,
+    "casos_lag_3": casos_lag_3,
+    "casos_lag_4": casos_lag_4,
+    "media_3_sem": np.mean([casos_lag_1, casos_lag_2, casos_lag_3]),
+    "media_4_sem_lluvia": precip,
+    "ratio_lluvia_temp": precip / temp if temp != 0 else 0,
+    "interaccion_temp_lluvia": temp * precip,
+    "interaccion_hist_clima": casos_lag_1 * temp,
+}
 
-riesgo_estacionalidad = calcular_riesgo_estacionalidad(semana_epi)
-riesgo_historial = calcular_riesgo_historial(casos_previos)
+X_nuevo = pd.DataFrame([registro_pred])[selected_features]
+pred_nivel = mejor_modelo.predict(X_nuevo)[0]
 
-riesgo_total = min(100.0, riesgo_clima + riesgo_estacionalidad + riesgo_historial)
-nivel, color, interpretacion = clasificar_riesgo(riesgo_total)
+if hasattr(mejor_modelo, "predict_proba"):
+    proba_individual = mejor_modelo.predict_proba(X_nuevo)[0]
+    confianza = float(np.max(proba_individual) * 100)
+else:
+    confianza = 0.0
+
+map_num = {"BAJO": 25, "MEDIO": 60, "ALTO": 90}
+riesgo_total = map_num.get(pred_nivel, 0)
+
+if pred_nivel == "BAJO":
+    color = "#22c55e"
+    interpretacion = "Condiciones relativamente favorables, con menor probabilidad de incremento de casos."
+elif pred_nivel == "MEDIO":
+    color = "#f59e0b"
+    interpretacion = "Se detecta un riesgo intermedio; conviene reforzar monitoreo y acciones preventivas."
+else:
+    color = "#ef4444"
+    interpretacion = "Alta probabilidad de incremento de casos; se recomienda intervención prioritaria."
 
 # --------------------------------------------------
 # MÉTRICAS SUPERIORES
@@ -600,14 +922,15 @@ nivel, color, interpretacion = clasificar_riesgo(riesgo_total)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Filas filtradas", len(base_filtrada))
 m2.metric("Provincias visibles", base_filtrada["provincia_std"].nunique())
-m3.metric("Años disponibles", base_modelo["anio"].nunique())
-m4.metric("Historial reciente", f"{riesgo_historial:.1f}%")
+m3.metric("Mejor modelo", mejor_modelo_nombre)
+m4.metric("F1-score", f"{resultado_mejor['f1']:.3f}")
 
 st.markdown(
     f"""
     <div class="metric-card">
-        <b>Interpretación:</b> <span style="color:{color}; font-weight:700;">{nivel}</span><br>
-        <span class="small-text">{interpretacion}</span>
+        <b>Predicción actual:</b> <span style="color:{color}; font-weight:700;">{pred_nivel}</span><br>
+        <span class="small-text">{interpretacion}</span><br>
+        <span class="small-text">Confianza del modelo: {confianza:.1f}%</span>
     </div>
     """,
     unsafe_allow_html=True
@@ -625,7 +948,7 @@ with col_grafico1:
         mode="gauge+number",
         value=riesgo_total,
         number={"suffix": "%", "font": {"size": 40}},
-        title={"text": f"Nivel de Riesgo: {nivel}", "font": {"size": 22, "color": color}},
+        title={"text": f"Nivel de Riesgo: {pred_nivel}", "font": {"size": 22, "color": color}},
         gauge={
             "axis": {"range": [0, 100], "tickwidth": 1},
             "bar": {"color": color, "thickness": 0.35},
@@ -649,77 +972,130 @@ with col_grafico1:
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="white")
     )
-
     st.plotly_chart(fig_gauge, use_container_width=True)
 
 with col_grafico2:
-    fig_bar = go.Figure(go.Bar(
-        x=[riesgo_clima, riesgo_estacionalidad, riesgo_historial],
-        y=["Clima", "Estacionalidad", "Historial"],
+    importancias = obtener_importancias(mejor_modelo, resultado_mejor["X_test"]).head(8)
+    fig_imp = px.bar(
+        importancias.sort_values("importance", ascending=True),
+        x="importance",
+        y="feature",
         orientation="h",
-        marker=dict(color=["#3b82f6", "#a855f7", "#10b981"]),
-        text=[
-            f"{riesgo_clima:.1f}%",
-            f"{riesgo_estacionalidad:.1f}%",
-            f"{riesgo_historial:.1f}%"
-        ],
-        textposition="outside"
-    ))
-
-    fig_bar.update_layout(
-        title="Contribución de factores al riesgo",
-        xaxis=dict(title="Puntaje", range=[0, 50]),
-        yaxis=dict(title="Factor"),
+        title="Importancia de variables"
+    )
+    fig_imp.update_layout(
         height=360,
-        margin=dict(l=20, r=20, t=60, b=20),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white")
+        font=dict(color="white"),
+        xaxis_title="Importancia",
+        yaxis_title="Variable"
     )
-
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_imp, use_container_width=True)
 
 st.markdown("---")
 
 # --------------------------------------------------
-# MAPA DE ECUADOR POR PROVINCIAS
+# MÉTRICAS DE EVALUACIÓN
+# --------------------------------------------------
+st.subheader("Evaluación del modelo")
+
+tabla_eval = pd.DataFrame([
+    {
+        "Modelo": nombre,
+        "Accuracy": round(res["accuracy"], 4),
+        "Precision": round(res["precision"], 4),
+        "Recall": round(res["recall"], 4),
+        "F1-score": round(res["f1"], 4),
+    }
+    for nombre, res in resultados.items()
+]).sort_values("F1-score", ascending=False)
+
+st.dataframe(tabla_eval, use_container_width=True, hide_index=True)
+
+col_cm1, col_cm2 = st.columns(2)
+
+with col_cm1:
+    cm = confusion_matrix(resultado_mejor["y_test"], resultado_mejor["pred"], labels=["BAJO", "MEDIO", "ALTO"])
+    df_cm = pd.DataFrame(cm, index=["Real BAJO", "Real MEDIO", "Real ALTO"], columns=["Pred BAJO", "Pred MEDIO", "Pred ALTO"])
+    st.write("**Matriz de confusión**")
+    st.dataframe(df_cm, use_container_width=True)
+
+with col_cm2:
+    st.write("**Mejores hiperparámetros**")
+    st.json(resultado_mejor["best_params"])
+
+st.markdown("---")
+
+# --------------------------------------------------
+# MAPA DE RIESGO PROVINCIAL
 # --------------------------------------------------
 st.subheader("Mapa de riesgo por provincia")
 
 try:
-    with open(rutas_locales["geojson"], "r", encoding="utf-8") as f:
+    with open(ruta_segura(rutas_locales["geojson"]), "r", encoding="utf-8") as f:
         geojson_ecuador = json.load(f)
 
     geojson_ecuador = preparar_geojson_provincias(geojson_ecuador)
+    df_pred_prov = construir_prediccion_provincial(base_filtrada, mejor_modelo, selected_features)
 
-    df_resumen_prov = obtener_resumen_provincial(base_filtrada)
-
-    fig_mapa = crear_mapa_provincias(df_resumen_prov, geojson_ecuador)
+    fig_mapa = crear_mapa_provincias(df_pred_prov, geojson_ecuador)
     st.plotly_chart(fig_mapa, use_container_width=True)
 
-    if not df_resumen_prov.empty:
-        provincia_mayor_riesgo = df_resumen_prov.sort_values("riesgo_total", ascending=False).iloc[0]
-
-        if anio_sel == "Todos":
-            texto_periodo = "en todo el período analizado"
-        else:
-            texto_periodo = f"en el año {anio_sel}"
-
+    if not df_pred_prov.empty:
+        provincia_mayor_riesgo = df_pred_prov.sort_values("riesgo_total", ascending=False).iloc[0]
+        texto_periodo = "en todo el período analizado" if anio_sel == "Todos" else f"en el año {anio_sel}"
         st.info(
             f"Provincia con mayor riesgo {texto_periodo}: "
             f"**{provincia_mayor_riesgo['provincia_std']}** "
-            f"con **{provincia_mayor_riesgo['riesgo_total']:.1f}%**."
+            f"con nivel **{provincia_mayor_riesgo['nivel_predicho']}** "
+            f"y confianza de **{provincia_mayor_riesgo['confianza_modelo']:.1f}%**."
         )
 
 except FileNotFoundError:
-    st.warning(
-        "No se encontró el archivo `dataset/ecuador_provincias.geojson`. "
-        "Agrégalo a esa carpeta para visualizar el mapa por provincias."
-    )
+    st.warning("No se encontró el archivo `dataset/ecuador_provincias.geojson`.")
 except Exception as exc:
     st.warning(f"No se pudo generar el mapa provincial: {exc}")
 
+st.markdown("---")
+st.subheader("Predicción de número de casos por provincia")
 
+df_pred_casos = construir_prediccion_casos_provincial(
+    base_filtrada,
+    mejor_modelo_reg,
+    entrenamiento_reg["selected_features"]
+)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Modelo regresión", mejor_modelo_reg_nombre)
+c2.metric("MAE", f"{resultado_mejor_reg['mae']:.2f}")
+c3.metric("RMSE", f"{resultado_mejor_reg['rmse']:.2f}")
+
+st.dataframe(df_pred_casos, use_container_width=True, hide_index=True)
+
+fig_pred_casos = px.bar(
+    df_pred_casos.head(10),
+    x="provincia_std",
+    y="casos_predichos_prox_semana",
+    text="casos_predichos_prox_semana",
+    title="Top 10 provincias con más casos estimados para la próxima semana"
+)
+
+fig_pred_casos.update_layout(
+    height=420,
+    xaxis_title="Provincia",
+    yaxis_title="Casos estimados",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="white")
+)
+
+st.plotly_chart(fig_pred_casos, use_container_width=True)
+
+
+# --------------------------------------------------
+# CASOS POR AÑO
+# --------------------------------------------------
 st.subheader("Casos de dengue por año")
 
 casos_por_anio = (
@@ -748,23 +1124,107 @@ fig_casos_anio.update_layout(
 st.plotly_chart(fig_casos_anio, use_container_width=True)
 
 # --------------------------------------------------
-# TABLA DE DETALLE
+# FEATURES SELECCIONADAS
 # --------------------------------------------------
-st.subheader("Detalle del cálculo")
+st.subheader("Selección de características")
+
+corr_df = entrenamiento["corr"].reset_index()
+corr_df.columns = ["feature", "correlacion_abs_con_casos_futuros"]
+
+st.write("**Variables seleccionadas para el entrenamiento**")
+st.dataframe(
+    pd.DataFrame({"feature_seleccionada": selected_features}),
+    use_container_width=True,
+    hide_index=True
+)
+
+fig_corr = px.bar(
+    corr_df.head(12),
+    x="feature",
+    y="correlacion_abs_con_casos_futuros",
+    title="Relevancia inicial de variables"
+)
+fig_corr.update_layout(
+    height=380,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="white"),
+    xaxis_title="Variable",
+    yaxis_title="Correlación absoluta"
+)
+st.plotly_chart(fig_corr, use_container_width=True)
+
+# --------------------------------------------------
+# SHAP OPCIONAL
+# --------------------------------------------------
+st.subheader("Interpretabilidad avanzada")
+
+try:
+    import shap
+
+    muestra_shap = resultado_mejor["X_test"].head(50).copy()
+    explainer = shap.Explainer(mejor_modelo, resultado_mejor["X_train"])
+    shap_values = explainer(muestra_shap)
+
+    shap_mean = np.abs(shap_values.values).mean(axis=0)
+    df_shap = pd.DataFrame({
+        "feature": muestra_shap.columns,
+        "shap_mean_abs": shap_mean
+    }).sort_values("shap_mean_abs", ascending=False)
+
+    fig_shap = px.bar(
+        df_shap.head(10).sort_values("shap_mean_abs", ascending=True),
+        x="shap_mean_abs",
+        y="feature",
+        orientation="h",
+        title="Importancia promedio SHAP"
+    )
+    fig_shap.update_layout(
+        height=400,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="white"),
+        xaxis_title="Impacto SHAP medio",
+        yaxis_title="Variable"
+    )
+    st.plotly_chart(fig_shap, use_container_width=True)
+
+except Exception:
+    st.info("SHAP no está disponible. La app sigue usando importancia de variables del modelo.")
+
+# --------------------------------------------------
+# TABLA DE DETALLE DE LA PREDICCIÓN ACTUAL
+# --------------------------------------------------
+st.subheader("Detalle de la predicción actual")
 
 detalle = pd.DataFrame({
-    "Factor": ["Temperatura", "Precipitación", "Clima total", "Estacionalidad", "Historial", "Riesgo total"],
-    "Valor de entrada": [f"{temp} °C", f"{precip} mm/sem", "-", f"Semana {semana_epi}", f"{casos_previos} casos", "-"],
-    "Puntaje": [
-        round(riesgo_temp, 2),
-        round(riesgo_lluvia, 2),
-        round(riesgo_clima, 2),
-        round(riesgo_estacionalidad, 2),
-        round(riesgo_historial, 2),
-        round(riesgo_total, 2)
+    "Variable": [
+        "Temperatura",
+        "Precipitación",
+        "Semana epidemiológica",
+        "Casos lag 1",
+        "Casos lag 2",
+        "Casos lag 3",
+        "Casos lag 4",
+        "Media 3 semanas",
+        "Ratio lluvia/temp",
+        "Predicción final",
+        "Confianza"
+    ],
+    "Valor": [
+        round(temp, 2),
+        round(precip, 2),
+        semana_epi,
+        casos_lag_1,
+        casos_lag_2,
+        casos_lag_3,
+        casos_lag_4,
+        round(np.mean([casos_lag_1, casos_lag_2, casos_lag_3]), 2),
+        round((precip / temp if temp != 0 else 0), 4),
+        pred_nivel,
+        f"{confianza:.1f}%"
     ]
 })
-
 st.dataframe(detalle, use_container_width=True, hide_index=True)
 
 # --------------------------------------------------
@@ -772,15 +1232,15 @@ st.dataframe(detalle, use_container_width=True, hide_index=True)
 # --------------------------------------------------
 st.subheader("Recomendación automática")
 
-if nivel == "BAJO":
-    st.success("Mantener vigilancia de rutina y seguimiento de indicadores climáticos.")
-elif nivel == "MODERADO":
-    st.warning("Reforzar monitoreo semanal, campañas de prevención y revisión de zonas críticas.")
+if pred_nivel == "BAJO":
+    st.success("Mantener vigilancia rutinaria, seguimiento semanal y monitoreo climático.")
+elif pred_nivel == "MEDIO":
+    st.warning("Reforzar monitoreo semanal, campañas preventivas y control focalizado.")
 else:
-    st.error("Priorizar intervención preventiva, control vectorial y vigilancia intensiva.")
+    st.error("Priorizar intervención sanitaria, control vectorial y vigilancia intensiva.")
 
 # --------------------------------------------------
-# PREVIEW DEL DATASET UNIFICADO AL FINAL
+# PREVIEW DEL DATASET UNIFICADO
 # --------------------------------------------------
 st.markdown("---")
 st.subheader("Vista previa del dataset unificado")
