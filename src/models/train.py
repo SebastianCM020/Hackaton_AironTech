@@ -120,7 +120,7 @@ def get_model(model_type: str, task: str, config: dict):
 
     models = {
         ("rf", "classification"):   RandomForestClassifier(**rf_params),
-        ("rf", "regression"):       RandomForestRegressor(**{k: v for k, v in rf_params.items()}),
+        ("rf", "regression"):       RandomForestRegressor(**rf_params),
         ("xgb", "classification"):  XGBClassifier(**xgb_params, eval_metric="logloss",
                                                    use_label_encoder=False,
                                                    verbosity=0),

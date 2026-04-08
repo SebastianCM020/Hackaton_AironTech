@@ -239,11 +239,11 @@ def generate_synthetic_data() -> pd.DataFrame:
                         acumulados_mes += casos
 
                     # Nivel de riesgo multiclase
-                    if casos == 0:
+                    if int(casos) == 0:
                         nivel_riesgo = "bajo"
-                    elif casos <= 5:
+                    elif int(casos) <= 5:
                         nivel_riesgo = "medio"
-                    elif casos <= 20:
+                    elif int(casos) <= 20:
                         nivel_riesgo = "alto"
                     else:
                         nivel_riesgo = "muy_alto"

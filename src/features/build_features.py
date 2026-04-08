@@ -6,6 +6,9 @@ Agrega variables de rezago, promedios móviles, interacciones y estacionalidad.
 import numpy as np
 import pandas as pd
 
+# Epsilon para evitar división por cero en normalizaciones
+_EPSILON = 1e-9
+
 
 def add_lag_features(
     df: pd.DataFrame,
@@ -138,10 +141,10 @@ def add_risk_index(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     temp_norm = (df["temperatura_promedio"] - df["temperatura_promedio"].min()) / (
-        df["temperatura_promedio"].max() - df["temperatura_promedio"].min() + 1e-9
+        df["temperatura_promedio"].max() - df["temperatura_promedio"].min() + _EPSILON
     )
     precip_norm = (df["precipitacion_mm"] - df["precipitacion_mm"].min()) / (
-        df["precipitacion_mm"].max() - df["precipitacion_mm"].min() + 1e-9
+        df["precipitacion_mm"].max() - df["precipitacion_mm"].min() + _EPSILON
     )
     aedes_norm = df["indice_aedes"]
     salud_inv = 1 - df["cobertura_salud"]

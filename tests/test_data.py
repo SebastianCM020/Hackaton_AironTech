@@ -33,7 +33,10 @@ def synthetic_df():
 
 
 def test_generate_synthetic_data_shape(synthetic_df):
-    """El dataset debe tener al menos 60 000 filas (215 cantones × 6 años × 52 semanas)."""
+    """El dataset debe tener al menos 60 000 filas.
+
+    Estimación: 215 cantones × 6 años (2018-2023) × 52 semanas ≈ 67 080 registros.
+    """
     assert synthetic_df.shape[0] > 60_000, (
         f"Se esperaban >60 000 filas, se obtuvieron {synthetic_df.shape[0]}"
     )
