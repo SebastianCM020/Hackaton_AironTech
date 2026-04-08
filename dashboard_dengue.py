@@ -3,6 +3,11 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import unicodedata
+import plotly.express as px
+import pandas as pd
+import numpy as np
+import unicodedata
+import json
 from pathlib import Path
 
 # --------------------------------------------------
@@ -356,6 +361,9 @@ def construir_dataset_unificado(
         .rename(columns={"rfh": "precipitacion_total"})
     )
 
+    # ----------------------------
+    # CLIMA
+    # ----------------------------
     clima = pd.read_csv(ruta_clima)
     clima = normalizar_columnas(clima)
     clima["date"] = pd.to_datetime(clima["date"], errors="coerce")
