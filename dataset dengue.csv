@@ -1,0 +1,21 @@
+id_paciente,adm_0_name,adm_1_name,year,semana_epidemiologica,edad,sexo,clasificacion_final,fiebre,nauseas_vomitos,dolor_abdominal,trombocitopenia
+1,Ecuador,Guayas,2024,12,34,M,DSSA,1,0,0,0
+2,Ecuador,Manabí,2025,8,15,F,DCSA,1,1,1,0
+3,Ecuador,Los Ríos,2024,22,45,M,DSSA,1,0,0,0
+4,Ecuador,El Oro,2026,3,32,F,DG,1,1,1,1
+5,Ecuador,Santo Domingo,2025,14,8,M,DSSA,1,0,0,0
+6,Ecuador,Pichincha,2023,45,28,F,DSSA,1,1,0,0
+7,Ecuador,Esmeraldas,2024,10,54,M,DSSA,1,0,0,0
+8,Ecuador,Guayas,2025,2,19,F,DSSA,1,0,0,0
+9,Ecuador,Manabí,2026,18,60,M,DCSA,1,1,1,0
+10,Ecuador,Los Ríos,2023,33,12,M,DSSA,1,0,0,0
+11,Ecuador,El Oro,2024,7,41,F,DSSA,1,0,0,0
+12,Ecuador,Santo Domingo,2025,25,22,M,DSSA,1,1,0,0
+13,Ecuador,Guayas,2026,40,71,F,DG,1,1,1,1
+14,Ecuador,Manabí,2024,11,9,M,DSSA,1,0,0,0
+15,Ecuador,Pichincha,2025,16,38,F,DSSA,1,0,0,0
+16,Ecuador,Esmeraldas,2023,50,47,M,DCSA,1,1,1,0
+17,Ecuador,Guayas,2024,5,26,F,DSSA,1,0,0,0
+18,Ecuador,Los Ríos,2025,29,55,M,DSSA,1,0,0,0
+19,Ecuador,El Oro,2026,8,33,F,DSSA,1,0,0,0
+20,Ecuador,Santo Domingo,2024,14,17,M,DSSA,0,0,0,0
