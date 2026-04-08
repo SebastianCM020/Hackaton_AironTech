@@ -119,6 +119,128 @@ def _primera_columna_disponible(df: pd.DataFrame, candidatas: list[str]) -> str 
             return columna
     return None
 
+def estandarizar_nombre_provincia(texto: str) -> str:
+    texto = str(texto).strip().upper()
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("utf-8")
+    texto = " ".join(texto.split())
+
+    equivalencias = {
+        "CAÑAR": "CANAR",
+        "CANAR": "CANAR",
+        "GALÁPAGOS": "GALAPAGOS",
+        "GALAPAGOS": "GALAPAGOS",
+        "LOS RÍOS": "LOS RIOS",
+        "LOS RIOS": "LOS RIOS",
+        "SANTO DOMINGO DE LOS TSACHILAS": "SANTO DOMINGO DE LOS TSACHILAS",
+        "SANTO DOMINGO DE LOS TSÁCHILAS": "SANTO DOMINGO DE LOS TSACHILAS",
+        "MORONA-SANTIAGO": "MORONA SANTIAGO",
+        "ZAMORA-CHINCHIPE": "ZAMORA CHINCHIPE",
+        "EL ORO": "EL ORO",
+        "SANTA ELENA": "SANTA ELENA",
+    }
+
+    return equivalencias.get(texto, texto)
+
+
+def preparar_geojson_provincias(geojson: dict) -> dict:
+    for feature in geojson["features"]:
+        props = feature.get("properties", {})
+
+        nombre = (
+            props.get("name")
+            or props.get("NAME")
+            or props.get("provincia")
+            or props.get("PROVINCIA")
+            or props.get("DPA_DESPRO")
+            or props.get("NOM_PROV")
+            or ""
+        )
+
+        feature["properties"]["provincia_std"] = estandarizar_nombre_provincia(nombre)
+
+    return geojson
+
+
+def obtener_resumen_provincial(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["temperatura_promedio"] = pd.to_numeric(df["temperatura_promedio"], errors="coerce").fillna(28.0)
+    df["precipitacion_total"] = pd.to_numeric(df["precipitacion_total"], errors="coerce").fillna(80.0)
+    df["casos_previos"] = pd.to_numeric(df["casos_previos"], errors="coerce").fillna(0)
+    df["semana_epi"] = pd.to_numeric(df["semana_epi"], errors="coerce").fillna(12).astype(int)
+    df["casos_dengue"] = pd.to_numeric(df["casos_dengue"], errors="coerce").fillna(0)
+
+    df["riesgo_temp"] = df["temperatura_promedio"].apply(calcular_riesgo_temperatura)
+    df["riesgo_lluvia"] = df["precipitacion_total"].apply(calcular_riesgo_lluvia)
+    df["riesgo_clima"] = df["riesgo_temp"] + df["riesgo_lluvia"]
+    df["riesgo_estacionalidad"] = df["semana_epi"].apply(calcular_riesgo_estacionalidad)
+    df["riesgo_historial"] = df["casos_previos"].apply(calcular_riesgo_historial)
+    df["riesgo_total"] = (
+        df["riesgo_clima"] + df["riesgo_estacionalidad"] + df["riesgo_historial"]
+    ).clip(upper=100)
+
+    df["provincia_std"] = df["provincia_std"].apply(estandarizar_nombre_provincia)
+
+    # Último registro disponible por provincia dentro del filtro actual
+    ultimo = (
+        df.sort_values(["provincia_std", "anio", "semana_epi"])
+          .groupby("provincia_std", as_index=False)
+          .tail(1)
+          .copy()
+    )
+
+    ultimo["nivel"] = ultimo["riesgo_total"].apply(lambda x: clasificar_riesgo(x)[0])
+
+    # También sumamos casos por provincia dentro del filtro actual
+    casos = (
+        df.groupby("provincia_std", as_index=False)["casos_dengue"]
+          .sum()
+          .rename(columns={"casos_dengue": "casos_dengue_periodo"})
+    )
+
+    resumen = ultimo.merge(casos, on="provincia_std", how="left")
+    return resumen
+
+
+def crear_mapa_provincias(df_resumen: pd.DataFrame, geojson: dict):
+    fig = px.choropleth_mapbox(
+        df_resumen,
+        geojson=geojson,
+        locations="provincia_std",
+        featureidkey="properties.provincia_std",
+        color="riesgo_total",
+        color_continuous_scale=[
+            [0.00, "#22c55e"],
+            [0.50, "#f59e0b"],
+            [1.00, "#ef4444"]
+        ],
+        range_color=(0, 100),
+        mapbox_style="carto-positron",
+        zoom=4.8,
+        center={"lat": -1.6, "lon": -78.3},
+        opacity=0.78,
+        hover_name="provincia_std",
+        hover_data={
+            "riesgo_total": ":.1f",
+            "nivel": True,
+            "anio": True,
+            "semana_epi": True,
+            "casos_dengue_periodo": True,
+            "temperatura_promedio": ":.1f",
+            "precipitacion_total": ":.1f",
+            "provincia_std": False
+        },
+    )
+
+    fig.update_traces(marker_line_width=1, marker_line_color="white")
+
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=540,
+        coloraxis_colorbar=dict(title="Riesgo %")
+    )
+
+    return fig
 
 CODIGOS_PROVINCIA_ECUADOR = {
     "01": "AZUAY",
@@ -179,7 +301,7 @@ def construir_dataset_unificado(
 
         df_hoja["anio"] = pd.to_numeric(df_hoja[col_anio], errors="coerce")
         df_hoja["semana_epi"] = pd.to_numeric(df_hoja[col_semana], errors="coerce")
-        df_hoja["provincia_std"] = limpiar_texto_ubicacion(df_hoja[col_provincia])
+        df_hoja["provincia_std"] = limpiar_texto_ubicacion(df_hoja[col_provincia]).apply(estandarizar_nombre_provincia)
         df_hoja["casos_dengue"] = (
             pd.to_numeric(df_hoja[col_total], errors="coerce").fillna(1)
             if col_total
@@ -217,7 +339,7 @@ def construir_dataset_unificado(
     lluvia["rfh"] = pd.to_numeric(lluvia["rfh"], errors="coerce")
     lluvia["pcode"] = lluvia["pcode"].astype(str).str.upper()
     lluvia["codigo_provincia"] = lluvia["pcode"].str.extract(r"EC(\d{2})")
-    lluvia["provincia_std"] = lluvia["codigo_provincia"].map(CODIGOS_PROVINCIA_ECUADOR)
+    lluvia["provincia_std"] = lluvia["codigo_provincia"].map(CODIGOS_PROVINCIA_ECUADOR).apply(estandarizar_nombre_provincia)
     lluvia["anio"] = lluvia["date"].dt.year
     lluvia["semana_epi"] = lluvia["date"].dt.isocalendar().week.astype("Int64")
 
@@ -416,12 +538,22 @@ if base_modelo is None or base_modelo.empty:
 # --------------------------------------------------
 # SELECCIÓN DE PROVINCIA
 # --------------------------------------------------
-st.subheader("1. Selección de registro para simulación")
+st.subheader("Filtros de análisis")
 
-provincias_disponibles = sorted(base_modelo["provincia_std"].dropna().unique().tolist())
+anios_disponibles = sorted(base_modelo["anio"].dropna().unique().tolist())
+
+opciones_anio = ["Todos"] + [int(a) for a in anios_disponibles]
+anio_sel = st.selectbox("Filtrar por año", opciones_anio)
+
+if anio_sel == "Todos":
+    base_filtrada = base_modelo.copy()
+else:
+    base_filtrada = base_modelo[base_modelo["anio"] == anio_sel].copy()
+
+provincias_disponibles = sorted(base_filtrada["provincia_std"].dropna().unique().tolist())
 provincia_sel = st.selectbox("Provincia", provincias_disponibles)
 
-df_filtrado = base_modelo[base_modelo["provincia_std"] == provincia_sel].copy()
+df_filtrado = base_filtrada[base_filtrada["provincia_std"] == provincia_sel].copy()
 
 if not df_filtrado.empty:
     fila = df_filtrado.sort_values(["anio", "semana_epi"]).iloc[-1]
@@ -466,9 +598,9 @@ nivel, color, interpretacion = clasificar_riesgo(riesgo_total)
 # MÉTRICAS SUPERIORES
 # --------------------------------------------------
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Riesgo total", f"{riesgo_total:.1f}%")
-m2.metric("Nivel", nivel)
-m3.metric("Riesgo climático", f"{riesgo_clima:.1f}%")
+m1.metric("Filas filtradas", len(base_filtrada))
+m2.metric("Provincias visibles", base_filtrada["provincia_std"].nunique())
+m3.metric("Años disponibles", base_modelo["anio"].nunique())
 m4.metric("Historial reciente", f"{riesgo_historial:.1f}%")
 
 st.markdown(
@@ -552,19 +684,33 @@ st.markdown("---")
 # --------------------------------------------------
 # MAPA DE ECUADOR POR PROVINCIAS
 # --------------------------------------------------
-st.subheader("2. Mapa de riesgo por provincia")
+st.subheader("Mapa de riesgo por provincia")
 
 try:
-    geojson_ecuador = cargar_geojson_provincias(rutas_locales["geojson"])
-    df_riesgo_prov = construir_riesgo_por_provincia(base_modelo)
-    fig_mapa = crear_mapa_provincias(df_riesgo_prov, geojson_ecuador)
+    with open(rutas_locales["geojson"], "r", encoding="utf-8") as f:
+        geojson_ecuador = json.load(f)
+
+    geojson_ecuador = preparar_geojson_provincias(geojson_ecuador)
+
+    df_resumen_prov = obtener_resumen_provincial(base_filtrada)
+
+    fig_mapa = crear_mapa_provincias(df_resumen_prov, geojson_ecuador)
     st.plotly_chart(fig_mapa, use_container_width=True)
 
-    provincia_mayor_riesgo = df_riesgo_prov.sort_values("riesgo_total", ascending=False).iloc[0]
-    st.info(
-        f"Provincia con mayor riesgo actual: **{provincia_mayor_riesgo['provincia_std']}** "
-        f"con **{provincia_mayor_riesgo['riesgo_total']:.1f}%**."
-    )
+    if not df_resumen_prov.empty:
+        provincia_mayor_riesgo = df_resumen_prov.sort_values("riesgo_total", ascending=False).iloc[0]
+
+        if anio_sel == "Todos":
+            texto_periodo = "en todo el período analizado"
+        else:
+            texto_periodo = f"en el año {anio_sel}"
+
+        st.info(
+            f"Provincia con mayor riesgo {texto_periodo}: "
+            f"**{provincia_mayor_riesgo['provincia_std']}** "
+            f"con **{provincia_mayor_riesgo['riesgo_total']:.1f}%**."
+        )
+
 except FileNotFoundError:
     st.warning(
         "No se encontró el archivo `dataset/ecuador_provincias.geojson`. "
@@ -573,10 +719,38 @@ except FileNotFoundError:
 except Exception as exc:
     st.warning(f"No se pudo generar el mapa provincial: {exc}")
 
+
+st.subheader("Casos de dengue por año")
+
+casos_por_anio = (
+    base_modelo.groupby("anio", as_index=False)["casos_dengue"]
+    .sum()
+    .sort_values("anio")
+)
+
+fig_casos_anio = px.bar(
+    casos_por_anio,
+    x="anio",
+    y="casos_dengue",
+    text="casos_dengue",
+    title="Total de casos de dengue por año"
+)
+
+fig_casos_anio.update_layout(
+    height=420,
+    xaxis_title="Año",
+    yaxis_title="Casos",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="white")
+)
+
+st.plotly_chart(fig_casos_anio, use_container_width=True)
+
 # --------------------------------------------------
 # TABLA DE DETALLE
 # --------------------------------------------------
-st.subheader("3. Detalle del cálculo")
+st.subheader("Detalle del cálculo")
 
 detalle = pd.DataFrame({
     "Factor": ["Temperatura", "Precipitación", "Clima total", "Estacionalidad", "Historial", "Riesgo total"],
@@ -596,7 +770,7 @@ st.dataframe(detalle, use_container_width=True, hide_index=True)
 # --------------------------------------------------
 # RECOMENDACIÓN FINAL
 # --------------------------------------------------
-st.subheader("4. Recomendación automática")
+st.subheader("Recomendación automática")
 
 if nivel == "BAJO":
     st.success("Mantener vigilancia de rutina y seguimiento de indicadores climáticos.")
@@ -609,16 +783,33 @@ else:
 # PREVIEW DEL DATASET UNIFICADO AL FINAL
 # --------------------------------------------------
 st.markdown("---")
-st.subheader("5. Vista previa del dataset unificado")
+st.subheader("Vista previa del dataset unificado")
+
+col_f1, col_f2 = st.columns(2)
+
+with col_f1:
+    opciones_preview_anio = ["Todos"] + sorted(base_modelo["anio"].dropna().unique().tolist())
+    preview_anio = st.selectbox("Filtrar preview por año", opciones_preview_anio, key="preview_anio")
+
+with col_f2:
+    opciones_orden = ["Más recientes primero", "Más antiguos primero"]
+    orden_preview = st.selectbox("Orden de visualización", opciones_orden, key="orden_preview")
+
+df_preview = base_modelo.copy()
+
+if preview_anio != "Todos":
+    df_preview = df_preview[df_preview["anio"] == preview_anio].copy()
+
+ascendente = orden_preview == "Más antiguos primero"
+
+df_preview = df_preview.sort_values(
+    ["anio", "semana_epi", "provincia_std"],
+    ascending=ascendente
+)
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Filas totales", len(base_modelo))
-m2.metric("Provincias", base_modelo["provincia_std"].nunique())
-m3.metric("Años", base_modelo["anio"].nunique())
+m1.metric("Filas visibles", len(df_preview))
+m2.metric("Provincias visibles", df_preview["provincia_std"].nunique())
+m3.metric("Años visibles", df_preview["anio"].nunique())
 
-st.dataframe(base_modelo.head(30), use_container_width=True)
-
-st.caption(
-    "Nota: este dashboard usa una lógica heurística conceptual. "
-    "El siguiente paso ideal es reemplazarla por un modelo entrenado con tus datasets reales."
-)
+st.dataframe(df_preview, use_container_width=True, height=350)
