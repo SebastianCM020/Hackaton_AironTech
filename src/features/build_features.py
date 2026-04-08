@@ -69,13 +69,18 @@ def add_rolling_features(
     df = df.copy()
     df = df.sort_values(["canton_id", "year", "semana_epidemiologica"])
 
+    def _lagged_rolling_mean(series: pd.Series, window: int) -> pd.Series:
+        """Calcula la media móvil sobre valores pasados (shift(1)) para evitar
+        filtración de datos del período actual en el promedio histórico."""
+        return series.shift(1).rolling(window, min_periods=1).mean()
+
     for col in roll_cols:
         if col not in df.columns:
             continue
         for w in windows:
             df[f"{col}_roll{w}"] = (
                 df.groupby("canton_id")[col]
-                .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
+                .transform(_lagged_rolling_mean, w)
                 .fillna(0)
             )
     return df
