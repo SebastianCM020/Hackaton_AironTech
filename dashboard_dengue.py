@@ -7,6 +7,8 @@ import unicodedata
 import json
 import warnings
 from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import GridSearchCV
@@ -546,6 +548,82 @@ def entrenar_modelos(df_full: pd.DataFrame):
         "mejor_modelo": mejor_modelo
     }
 
+def entrenar_modelos_regresion(df_full: pd.DataFrame):
+    df = df_full.copy()
+    df = df.dropna(subset=["casos_futuros"])
+
+    selected_features, corr = seleccionar_features(df)
+
+    # split temporal
+    tiempo_ordenado = df[["anio", "semana_epi"]].drop_duplicates().sort_values(["anio", "semana_epi"])
+    corte = int(len(tiempo_ordenado) * 0.80)
+    tiempo_train = tiempo_ordenado.iloc[:corte]
+    tiempo_test = tiempo_ordenado.iloc[corte:]
+
+    train_keys = set(zip(tiempo_train["anio"], tiempo_train["semana_epi"]))
+    test_keys = set(zip(tiempo_test["anio"], tiempo_test["semana_epi"]))
+
+    df_train = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(train_keys)].copy()
+    df_test = df[df[["anio", "semana_epi"]].apply(tuple, axis=1).isin(test_keys)].copy()
+
+    X_train = df_train[selected_features].copy()
+    y_train = df_train["casos_futuros"].copy()
+
+    X_test = df_test[selected_features].copy()
+    y_test = df_test["casos_futuros"].copy()
+
+    modelos = {
+        "Random Forest Regressor": RandomForestRegressor(
+            n_estimators=200,
+            max_depth=8,
+            random_state=42
+        ),
+        "Gradient Boosting Regressor": GradientBoostingRegressor(
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42
+        )
+    }
+
+    resultados = {}
+    mejor_modelo_nombre = None
+    mejor_mae = float("inf")
+    mejor_modelo = None
+
+    for nombre, modelo in modelos.items():
+        modelo.fit(X_train, y_train)
+        pred = modelo.predict(X_test)
+
+        mae = mean_absolute_error(y_test, pred)
+        rmse = np.sqrt(mean_squared_error(y_test, pred))
+        r2 = r2_score(y_test, pred)
+
+        resultados[nombre] = {
+            "modelo": modelo,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "y_test": y_test,
+            "pred": pred,
+            "X_test": X_test,
+            "X_train": X_train,
+        }
+
+        if mae < mejor_mae:
+            mejor_mae = mae
+            mejor_modelo_nombre = nombre
+            mejor_modelo = modelo
+
+    return {
+        "selected_features": selected_features,
+        "corr": corr,
+        "df_train": df_train,
+        "df_test": df_test,
+        "resultados": resultados,
+        "mejor_modelo_nombre": mejor_modelo_nombre,
+        "mejor_modelo": mejor_modelo
+    }
 
 # --------------------------------------------------
 # INTERPRETABILIDAD
@@ -602,6 +680,31 @@ def construir_prediccion_provincial(df_modelo: pd.DataFrame, modelo, selected_fe
 
     ultimo = ultimo.merge(resumen_casos, on="provincia_std", how="left")
     return ultimo
+
+def construir_prediccion_casos_provincial(df_modelo: pd.DataFrame, modelo_regresion, selected_features: list[str]) -> pd.DataFrame:
+    df = df_modelo.copy()
+
+    ultimo = (
+        df.sort_values(["provincia_std", "anio", "semana_epi"])
+          .groupby("provincia_std", as_index=False)
+          .tail(1)
+          .copy()
+    )
+
+    X_pred = ultimo[selected_features].copy()
+    pred_casos = modelo_regresion.predict(X_pred)
+
+    ultimo["casos_predichos_prox_semana"] = np.maximum(pred_casos, 0).round().astype(int)
+
+    return ultimo[[
+        "provincia_std",
+        "anio",
+        "semana_epi",
+        "casos_dengue",
+        "casos_predichos_prox_semana",
+        "temperatura_promedio",
+        "precipitacion_total"
+    ]].sort_values("casos_predichos_prox_semana", ascending=False)
 
 
 def crear_mapa_provincias(df_riesgo: pd.DataFrame, geojson: dict):
@@ -701,6 +804,17 @@ def entrenar_pipeline(df):
 
 with st.spinner("Entrenando modelos y evaluando pipeline..."):
     entrenamiento = entrenar_pipeline(base_modelo)
+
+@st.cache_resource(show_spinner=False)
+def entrenar_pipeline_regresion(df):
+    return entrenar_modelos_regresion(df)
+
+with st.spinner("Entrenando modelo de regresión para estimar número de casos..."):
+    entrenamiento_reg = entrenar_pipeline_regresion(base_modelo)
+
+mejor_modelo_reg = entrenamiento_reg["mejor_modelo"]
+mejor_modelo_reg_nombre = entrenamiento_reg["mejor_modelo_nombre"]
+resultado_mejor_reg = entrenamiento_reg["resultados"][mejor_modelo_reg_nombre]
 
 mejor_modelo = entrenamiento["mejor_modelo"]
 mejor_modelo_nombre = entrenamiento["mejor_modelo_nombre"]
@@ -942,6 +1056,42 @@ except FileNotFoundError:
     st.warning("No se encontró el archivo `dataset/ecuador_provincias.geojson`.")
 except Exception as exc:
     st.warning(f"No se pudo generar el mapa provincial: {exc}")
+
+st.markdown("---")
+st.subheader("Predicción de número de casos por provincia")
+
+df_pred_casos = construir_prediccion_casos_provincial(
+    base_filtrada,
+    mejor_modelo_reg,
+    entrenamiento_reg["selected_features"]
+)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Modelo regresión", mejor_modelo_reg_nombre)
+c2.metric("MAE", f"{resultado_mejor_reg['mae']:.2f}")
+c3.metric("RMSE", f"{resultado_mejor_reg['rmse']:.2f}")
+
+st.dataframe(df_pred_casos, use_container_width=True, hide_index=True)
+
+fig_pred_casos = px.bar(
+    df_pred_casos.head(10),
+    x="provincia_std",
+    y="casos_predichos_prox_semana",
+    text="casos_predichos_prox_semana",
+    title="Top 10 provincias con más casos estimados para la próxima semana"
+)
+
+fig_pred_casos.update_layout(
+    height=420,
+    xaxis_title="Provincia",
+    yaxis_title="Casos estimados",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="white")
+)
+
+st.plotly_chart(fig_pred_casos, use_container_width=True)
+
 
 # --------------------------------------------------
 # CASOS POR AÑO
