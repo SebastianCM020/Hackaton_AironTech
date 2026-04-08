@@ -15,7 +15,8 @@ pip install streamlit
 pip install plotly
 pip install pandas
 pip install numpy
-pip install scikit-learn 
+pip install scikit-learn
+pip install openpyxl 
 ```
 ### 2. Iniciar la Interfaz
 ```bash
